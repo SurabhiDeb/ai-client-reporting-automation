@@ -1,0 +1,264 @@
+{
+  "name": "Client Reporting — Compute + Two-Gate + Narrative (Financial Services / QuickBooks)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Run Report (Manual / Demo)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [200, 520],
+      "notes": "DEMO: click Execute to run one client's monthly report end-to-end. LIVE: replace with a Schedule Trigger (e.g. 1st of month) that loops over your client list, or a webhook fired by your close checklist."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- MOCK QUICKBOOKS PULL ----\n// DEMO ONLY. Returns a realistic month of financials for ONE client.\n// Flip SCENARIO to see the two paths:\n//   'clean' -> data is good, nothing material -> report auto-assembles.\n//   'held'  -> dirty data + cash runway below floor -> report is HELD for a human.\n// LIVE: delete this node and pull from QuickBooks Online (P&L, Balance Sheet,\n//       prior period, budget) + a categorization/reconciliation read.\n\nconst SCENARIO = 'clean'; // <-- change to 'held' for the money-shot demo\n\nconst clean = {\n  client_name: 'Meridian Design Co.',\n  period_label: 'June 2026',\n  current: { revenue: 182400, cogs: 71100, opex: 84300, cash_balance: 246000,\n    expenses: { payroll: 52000, software: 6100, marketing: 12400, rent: 9800, other: 4000 } },\n  prior:   { revenue: 175800, cogs: 69200, opex: 83100,\n    expenses: { payroll: 51500, software: 5900, marketing: 11800, rent: 9800, other: 4100 } },\n  budget:  { revenue: 178000, opex: 85000 },\n  data_quality: { uncategorized_pct: 1.4, accounts_reconciled: true, has_prior: true, has_budget: true },\n  kpis: [ { name: 'Gross margin %', value: 61.0, expected_min: 55, expected_max: 68 },\n          { name: 'MRR churn %', value: 2.1, expected_min: 0, expected_max: 5 } ]\n};\n\nconst held = {\n  client_name: 'Northwind Logistics LLC',\n  period_label: 'June 2026',\n  current: { revenue: 148200, cogs: 96500, opex: 71000, cash_balance: 51000,\n    expenses: { payroll: 41000, fuel: 18900, software: 3200, rent: 5600, other: 2300 } },\n  prior:   { revenue: 151000, cogs: 88000, opex: 62000,\n    expenses: { payroll: 40500, fuel: 11200, software: 3100, rent: 5600, other: 1600 } },\n  budget:  { revenue: 155000, opex: 64000 },\n  data_quality: { uncategorized_pct: 22.0, accounts_reconciled: false, has_prior: true, has_budget: true },\n  kpis: [ { name: 'Gross margin %', value: 34.9, expected_min: 40, expected_max: 55 } ]\n};\n\nreturn [{ json: SCENARIO === 'held' ? held : clean }];"
+      },
+      "id": "mock-pull",
+      "name": "Mock QuickBooks Pull",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 520],
+      "notes": "Swap point #1. LIVE: replace with the QuickBooks Online node (read-scoped) pulling current + prior + budget + a categorization/reconciliation signal."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- NORMALIZE + COMPUTE METRICS (deterministic — NOT the LLM) ----\n// All arithmetic happens here so figures are exact, reproducible, auditable.\n// The model never computes anything; it only describes these numbers later.\nconst d = $json;\nconst c = d.current, p = d.prior, b = d.budget || {};\nconst pct = (a, base) => (base ? +(((a - base) / base) * 100).toFixed(1) : null);\n\nconst grossMargin = c.revenue ? +(((c.revenue - c.cogs) / c.revenue) * 100).toFixed(1) : null;\nconst priorMargin = p.revenue ? +(((p.revenue - p.cogs) / p.revenue) * 100).toFixed(1) : null;\nconst netIncome = c.revenue - c.cogs - c.opex;\nconst priorNet  = p.revenue - p.cogs - p.opex;\n\n// Approx cash runway: months of net burn the cash covers. Profitable => 'healthy'.\nconst netBurn = (c.cogs + c.opex) - c.revenue; // positive = burning cash\nconst runwayMonths = netBurn > 0 ? +(c.cash_balance / netBurn).toFixed(1) : 99; // 99 = healthy/not burning\n\n// Largest expense category swings vs prior (by % change).\nconst swings = Object.keys(c.expenses || {}).map(k => {\n  const cur = c.expenses[k], pr = (p.expenses || {})[k] || 0;\n  return { category: k, pct: pr ? +(((cur - pr) / pr) * 100).toFixed(1) : null, cur, pr };\n}).filter(x => x.pct !== null).sort((a, z) => Math.abs(z.pct) - Math.abs(a.pct));\nconst topSwings = swings.slice(0, 3);\n\nreturn [{ json: {\n  client_name: d.client_name,\n  period_label: d.period_label,\n  revenue: c.revenue,\n  revenue_mom_pct: pct(c.revenue, p.revenue),\n  revenue_vs_budget_pct: b.revenue ? pct(c.revenue, b.revenue) : null,\n  gross_margin_pct: grossMargin,\n  gross_margin_prior_pct: priorMargin,\n  margin_delta_pts: (grossMargin !== null && priorMargin !== null) ? +(grossMargin - priorMargin).toFixed(1) : null,\n  opex: c.opex,\n  opex_mom_pct: pct(c.opex, p.opex),\n  opex_vs_budget_pct: b.opex ? pct(c.opex, b.opex) : null,\n  net_income: netIncome,\n  net_income_mom_pct: pct(netIncome, priorNet),\n  cash_balance: c.cash_balance,\n  runway_months: runwayMonths,\n  top_expense_swings: topSwings,\n  top_expense_swings_text: topSwings.map(s => `${s.category} ${s.pct > 0 ? '+' : ''}${s.pct}%`).join(', '),\n  kpis: d.kpis || [],\n  kpi_summary: (d.kpis || []).map(k => `${k.name}: ${k.value}`).join('; '),\n  data_quality: d.data_quality || {}\n} }];"
+      },
+      "id": "compute",
+      "name": "Normalize + Compute Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- GATE 1: DATA-QUALITY GATE ----\n// Before we will build a client-facing report AT ALL, confirm the data is\n// trustworthy. Reporting on unfinished books is the worst failure mode here.\n// Thresholds are CONFIG the firm tunes — not hard logic.\nconst UNCATEGORIZED_LIMIT_PCT = 10; // firm-set: max % of txns allowed in Uncategorized\n\nconst j = $json;\nconst dq = j.data_quality || {};\nconst dqReasons = [];\n\nif ((dq.uncategorized_pct ?? 100) > UNCATEGORIZED_LIMIT_PCT)\n  dqReasons.push(`uncategorized ${dq.uncategorized_pct}% > ${UNCATEGORIZED_LIMIT_PCT}% limit`);\nif (dq.accounts_reconciled === false) dqReasons.push('key accounts not reconciled');\nif (dq.has_prior === false) dqReasons.push('missing prior period (no comparison possible)');\nif (dq.has_budget === false) dqReasons.push('missing budget');\n\nconst dqPass = dqReasons.length === 0;\n\nreturn [{ json: { ...j,\n  uncategorized_pct: dq.uncategorized_pct ?? null,\n  uncategorized_limit_pct: UNCATEGORIZED_LIMIT_PCT,\n  accounts_reconciled: dq.accounts_reconciled ?? null,\n  has_prior: dq.has_prior ?? null,\n  has_budget: dq.has_budget ?? null,\n  dq_pass: dqPass,\n  dq_reasons: dqReasons\n} }];"
+      },
+      "id": "gate-1",
+      "name": "Gate 1 · Data-Quality",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- GATE 2: MATERIALITY GATE + FINAL DECISION ----\n// Deterministic anomaly checks against firm-set thresholds. If nothing is\n// material AND the data is clean, the report is safe to auto-deliver.\n// If anything is material, hold for a human (draft is still produced).\n// Thresholds are CONFIG the firm tunes per client.\nconst RUNWAY_FLOOR_MONTHS   = 3;   // hold if cash runway drops below this\nconst REVENUE_MOVE_PCT       = 20; // hold if |revenue MoM| >= this\nconst REVENUE_BUDGET_MISS_PCT= 15; // hold if revenue is this far under budget\nconst MARGIN_DROP_PTS        = 5;  // hold if gross margin fell this many points\nconst EXPENSE_SPIKE_PCT      = 40; // hold if any expense category swung this much\n\nconst j = $json;\nconst flags = [];\n\nif (j.runway_months !== null && j.runway_months < RUNWAY_FLOOR_MONTHS)\n  flags.push(`cash runway ${j.runway_months} mo below ${RUNWAY_FLOOR_MONTHS}-mo floor`);\nif (j.revenue_mom_pct !== null && Math.abs(j.revenue_mom_pct) >= REVENUE_MOVE_PCT)\n  flags.push(`revenue moved ${j.revenue_mom_pct}% MoM (>= ${REVENUE_MOVE_PCT}%)`);\nif (j.revenue_vs_budget_pct !== null && j.revenue_vs_budget_pct <= -REVENUE_BUDGET_MISS_PCT)\n  flags.push(`revenue ${j.revenue_vs_budget_pct}% vs budget (missed by >= ${REVENUE_BUDGET_MISS_PCT}%)`);\nif (j.margin_delta_pts !== null && j.margin_delta_pts <= -MARGIN_DROP_PTS)\n  flags.push(`gross margin fell ${Math.abs(j.margin_delta_pts)} pts`);\n(j.top_expense_swings || []).forEach(s => {\n  if (s.pct !== null && Math.abs(s.pct) >= EXPENSE_SPIKE_PCT)\n    flags.push(`${s.category} expense swung ${s.pct > 0 ? '+' : ''}${s.pct}%`);\n});\n(j.kpis || []).forEach(k => {\n  if (k.value < k.expected_min || k.value > k.expected_max)\n    flags.push(`${k.name} = ${k.value} outside expected ${k.expected_min}-${k.expected_max}`);\n});\n\nconst materialPass = flags.length === 0;\nconst deliver = j.dq_pass && materialPass;\n\nlet gateTripped = 'none';\nif (!j.dq_pass && !materialPass) gateTripped = 'both';\nelse if (!j.dq_pass) gateTripped = 'data_quality';\nelse if (!materialPass) gateTripped = 'materiality';\n\nconst allFlags = [...(j.dq_reasons || []), ...flags];\n\nreturn [{ json: { ...j,\n  runway_floor: RUNWAY_FLOOR_MONTHS,\n  material_flags: flags,\n  material_pass: materialPass,\n  material_flags_text: allFlags.join('; ') || 'none',\n  decision: deliver ? 'deliver' : 'hold',\n  gate_tripped: gateTripped\n} }];"
+      },
+      "id": "gate-2",
+      "name": "Gate 2 · Materiality + Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 520]
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "mode": "list", "value": "gpt-4o-mini", "cachedResultName": "gpt-4o-mini" },
+        "messages": {
+          "values": [
+            { "role": "system", "content": "You write the monthly financial-report narrative for an outsourced accounting / fractional-CFO firm, in the firm's voice, for the firm's client. You are given figures that have ALREADY been computed. Your only job is to describe them clearly. Return ONLY valid JSON: {\"headline\":\"one calm sentence\",\"narrative\":\"3-6 short paragraphs\",\"kpi_callouts\":[\"short strings\"],\"watch_items\":[\"short strings for flagged items\"]}. HARD RULES: Use ONLY the numbers provided — never state, round differently, or invent any figure not given; if you'd need a number you weren't given, omit that point. Do NOT calculate anything; all variances/margins are already computed, only restate them. Do NOT speculate on WHY something changed unless a cause is provided — describe WHAT changed, not an unverified cause. If FLAGGED items are provided, your narrative MUST acknowledge each plainly and note it is under review — never downplay or omit. Keep it calm, factual, client-facing, professional; no hype, no alarmism, no emoji, no exclamation points. Output valid JSON only, no markdown fences." },
+            { "role": "user", "content": "=CLIENT: {{ $json.client_name }}\nPERIOD: {{ $json.period_label }}\nFIRM VOICE: clear, professional, concise\n\nCOMPUTED FIGURES (use only these — do not calculate):\n- Revenue: {{ $json.revenue }} | MoM: {{ $json.revenue_mom_pct }}% | vs budget: {{ $json.revenue_vs_budget_pct }}%\n- Gross margin: {{ $json.gross_margin_pct }}% | prior: {{ $json.gross_margin_prior_pct }}%\n- Operating expenses: {{ $json.opex }} | MoM: {{ $json.opex_mom_pct }}%\n- Net income: {{ $json.net_income }} | MoM: {{ $json.net_income_mom_pct }}%\n- Cash balance: {{ $json.cash_balance }} | Approx runway (months): {{ $json.runway_months }}\n- Largest expense swings: {{ $json.top_expense_swings_text }}\n- KPIs: {{ $json.kpi_summary }}\n\nFLAGGED / MATERIAL ITEMS (must acknowledge, being reviewed): {{ $json.material_flags_text }}\nPROVIDED CAUSES (only ones you may cite): none" }
+          ]
+        },
+        "jsonOutput": true,
+        "options": { "temperature": 0.3 }
+      },
+      "id": "draft-narrative",
+      "name": "LLM · Draft Report Narrative",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [1300, 520],
+      "credentials": {
+        "openAiApi": { "id": "REPLACE_WITH_OPENAI_CRED", "name": "OpenAI account" }
+      },
+      "notes": "Writes the narrative from ALREADY-computed numbers. Swap to Claude by replacing this node; the gates and math are model-agnostic. It cannot publish a figure the workflow didn't compute (hard rule in the prompt)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- ASSEMBLE REPORT ----\n// Parse the narrative defensively and build the final report object.\n// If the draft fails to parse, force a hold — never ship an empty report.\nconst g = $('Gate 2 · Materiality + Decision').item.json;\n\nlet n = { headline: '', narrative: '', kpi_callouts: [], watch_items: [] };\ntry {\n  const c = $json;\n  const txt = c.message?.content ?? c.content ?? c.text ?? JSON.stringify(c);\n  n = typeof txt === 'string' ? JSON.parse(txt) : txt;\n} catch (e) { /* leave empty -> narrativeValid false -> hold */ }\n\nconst narrativeValid = (n.narrative || '').length > 40 && (n.headline || '').length > 0;\n\nreturn [{ json: { ...g,\n  report: {\n    client: g.client_name, period: g.period_label,\n    headline: n.headline, narrative: n.narrative,\n    kpi_callouts: n.kpi_callouts || [], watch_items: n.watch_items || [],\n    figures: {\n      revenue: g.revenue, revenue_mom_pct: g.revenue_mom_pct,\n      gross_margin_pct: g.gross_margin_pct, net_income: g.net_income,\n      cash_balance: g.cash_balance, runway_months: g.runway_months\n    }\n  },\n  narrativeValid\n} }];"
+      },
+      "id": "assemble",
+      "name": "Assemble Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1520, 520]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "deliver",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "leftValue": "={{ $json.narrativeValid }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "route",
+      "name": "Deliver or Hold?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1740, 520],
+      "notes": "Auto-deliver ONLY if BOTH gates passed (decision = deliver) AND the narrative validated. If the draft failed to parse, even a clean month holds — never ship an empty/garbled client report."
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": { "__rl": true, "mode": "name", "value": "#client-reporting" },
+        "text": "=:white_check_mark: *Report ready — one tap to send to client*  ({{ $json.client_name }} · {{ $json.period_label }})\n*Both gates passed:* data clean, nothing material.\n*Headline:* {{ $json.report.headline }}\n*Snapshot:* revenue {{ $json.revenue_mom_pct }}% MoM · margin {{ $json.gross_margin_pct }}% · runway {{ $json.runway_months }} mo\n\n{{ $json.report.narrative }}\n\n_Approve to deliver, or open to edit. Nothing was sent to the client automatically._",
+        "otherOptions": {}
+      },
+      "id": "slack-deliver",
+      "name": "Slack · Report Ready (approve to send)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [1980, 380],
+      "credentials": {
+        "slackApi": { "id": "REPLACE_WITH_SLACK_CRED", "name": "Slack account" }
+      },
+      "notes": "Clean months land here as a finished report for a 5-second glance. LIVE: render the assembled report into the firm's branded Google Doc / Sheet / PDF template, then send to the client (or auto-send per client policy) instead of / in addition to this Slack card."
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "mode": "list", "value": "gpt-4o-mini", "cachedResultName": "gpt-4o-mini" },
+        "messages": {
+          "values": [
+            { "role": "system", "content": "You help an accounting firm's reviewer triage a monthly client report that was AUTOMATICALLY HELD before delivery. You are given the deterministic reasons it was held and the computed figures. Write a tight internal summary readable in ten seconds. Return ONLY valid JSON: {\"one_liner\":\"single sentence why it's held\",\"action_items\":[\"ordered, specific steps before it can ship\"],\"severity\":\"data_quality|material_change|both\"}. RULES: use only the provided reasons/figures, invent nothing; be specific and operational; order by what blocks delivery first (fix data before interpreting numbers); internal and direct, no hedging or reassurance; do not suggest sending the report. Output valid JSON only." },
+            { "role": "user", "content": "=CLIENT: {{ $json.client_name }}  PERIOD: {{ $json.period_label }}\nGATE THAT TRIPPED: {{ $json.gate_tripped }}\nDATA-QUALITY: uncategorized {{ $json.uncategorized_pct }}% (limit {{ $json.uncategorized_limit_pct }}%), reconciled={{ $json.accounts_reconciled }}, prior={{ $json.has_prior }}, budget={{ $json.has_budget }}\nMATERIAL FLAGS: {{ $json.material_flags_text }}\nKEY FIGURES: revenue MoM {{ $json.revenue_mom_pct }}%, margin {{ $json.gross_margin_pct }}%, runway {{ $json.runway_months }} mo (floor {{ $json.runway_floor }} mo)" }
+          ]
+        },
+        "jsonOutput": true,
+        "options": { "temperature": 0.2 }
+      },
+      "id": "summarize-hold",
+      "name": "LLM · Summarize Hold for Reviewer",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [1980, 660],
+      "credentials": {
+        "openAiApi": { "id": "REPLACE_WITH_OPENAI_CRED", "name": "OpenAI account" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the reviewer summary defensively.\nconst a = $('Assemble Report').item.json;\nlet h = { one_liner: '', action_items: [], severity: a.gate_tripped };\ntry {\n  const c = $json;\n  const txt = c.message?.content ?? c.content ?? c.text ?? JSON.stringify(c);\n  h = typeof txt === 'string' ? JSON.parse(txt) : txt;\n} catch (e) { h.one_liner = 'Held: ' + (a.material_flags_text || 'review needed'); }\nreturn [{ json: { ...a, hold_one_liner: h.one_liner, hold_actions: h.action_items || [], hold_severity: h.severity } }];"
+      },
+      "id": "parse-hold",
+      "name": "Parse Hold Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, 660]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": { "__rl": true, "mode": "name", "value": "#client-reporting" },
+        "text": "=:hand: *Report HELD — needs review before it can go out*  ({{ $json.client_name }} · {{ $json.period_label }})\n*Why:* {{ $json.hold_one_liner }}\n*Gate tripped:* {{ $json.gate_tripped }}\n*Flags:* {{ $json.material_flags_text }}\n\n*Do first:*\n{{ ($json.hold_actions || []).map(function(x,i){return (i+1)+'. '+x;}).join('\\n') }}\n\n*Draft narrative (NOT sent to client):*\n{{ $json.report.narrative }}\n\n_Fix the flagged items, then approve. Nothing was sent to the client._",
+        "otherOptions": {}
+      },
+      "id": "slack-review",
+      "name": "Slack · Human Review Queue",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [2420, 660],
+      "credentials": {
+        "slackApi": { "id": "REPLACE_WITH_SLACK_CRED", "name": "Slack account" }
+      },
+      "notes": "THE MONEY SHOT. A held month arrives as an ordered fix-list + the reason + the draft — so the reviewer clears it fast instead of rebuilding it. Nothing reached the client. Add interactive Approve/Edit buttons for a live build."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- LOG RUN (write-back / measurement) ----\n// Both paths land here. In a live build, append this row to a Google Sheet\n// or a database so the firm can see auto-delivered vs held, which gate tripped,\n// and estimated hours saved per client per month.\nconst j = $json;\nconst ESTIMATED_HOURS_SAVED_PER_REPORT = 6; // firm's manual-assembly baseline\nreturn [{ json: {\n  logged_at: new Date().toISOString(),\n  client: j.client_name,\n  period: j.period_label,\n  outcome: j.decision === 'deliver' && j.narrativeValid ? 'auto_assembled' : 'held_for_review',\n  gate_tripped: j.gate_tripped,\n  flags: j.material_flags_text,\n  hours_saved_estimate: ESTIMATED_HOURS_SAVED_PER_REPORT,\n  runway_months: j.runway_months,\n  revenue_mom_pct: j.revenue_mom_pct\n} }];"
+      },
+      "id": "log-run",
+      "name": "Log Run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, 520],
+      "notes": "LIVE: replace with a Google Sheets 'Append Row' (or DB insert) so the auto vs held split and hours-saved are reportable from month one."
+    },
+    {
+      "parameters": {
+        "content": "## Client Reporting — Compute + Two Gates + Narrative\n\n**The whole point lives in the two gates.** The LLM writes the narrative; it does NOT do the math and does NOT decide whether the report ships. Code does both.\n\n**A report auto-delivers ONLY IF both gates pass:**\n- **Gate 1 · Data-Quality** — data is real: uncategorized under limit, accounts reconciled, prior + budget present.\n- **Gate 2 · Materiality** — nothing moved past threshold: runway above floor, revenue/margin in band, no expense spike, KPIs in range.\n\nIf either trips → the report is HELD and routed to a human with the flags + draft. Nothing reaches the client.\n\n### Flow (left → right)\n1. **Mock QB Pull** (swap for QuickBooks) → 2. **Compute Metrics** (deterministic) → 3. **Gate 1 Data-Quality** → 4. **Gate 2 Materiality + Decision** → 5. **Draft Narrative** → 6. **Assemble**.\n7. **Deliver or Hold?**\n  - **Deliver:** Slack 'Report Ready (approve to send)'.\n  - **Hold:** Summarize hold → Slack Human Review Queue (the money shot).\nBoth → **Log Run** (auto vs held, gate, hours saved).\n\n**Why a firm trusts it:** never reports on dirty data, never auto-delivers a material change, never lets the model invent or recompute a number.",
+        "height": 420,
+        "width": 540,
+        "color": 5
+      },
+      "id": "sticky-overview",
+      "name": "How the gates work",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [980, 20]
+    },
+    {
+      "parameters": {
+        "content": "### Credentials to set (once)\n- **OpenAI account** → on the two LLM nodes. (Swap to Claude by replacing them; gates + math are model-agnostic.)\n- **Slack account** → on both Slack nodes. Set the channel (e.g. `#client-reporting`).\n- **QuickBooks Online** (live) → read-scoped connection on the pull node that replaces `Mock QuickBooks Pull`.\n\n### Demo vs live\n- **DEMO:** click Execute. In `Mock QuickBooks Pull`, set `SCENARIO = 'clean'` to watch a report auto-assemble, or `'held'` to watch both gates hold it for a human. No accounts needed except OpenAI + Slack.\n- **LIVE:** replace the mock with a QuickBooks Online pull (current + prior + budget + categorization/reconciliation read); add a Schedule Trigger looping your client list; render the assembled report into your branded Doc/Sheet/PDF template; append `Log Run` to a Google Sheet.\n\n### Config the firm tunes (NOT hard-coded logic)\n- Gate 1: uncategorized-share limit (`Gate 1` node).\n- Gate 2: runway floor, revenue-move band, budget-miss %, margin-drop pts, expense-spike %, KPI ranges (`Gate 2` node).\n- Firm narrative voice; per-client auto-send vs approve.",
+        "height": 460,
+        "width": 480,
+        "color": 4
+      },
+      "id": "sticky-setup",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1980, 900]
+    }
+  ],
+  "connections": {
+    "Run Report (Manual / Demo)": {
+      "main": [[{ "node": "Mock QuickBooks Pull", "type": "main", "index": 0 }]]
+    },
+    "Mock QuickBooks Pull": {
+      "main": [[{ "node": "Normalize + Compute Metrics", "type": "main", "index": 0 }]]
+    },
+    "Normalize + Compute Metrics": {
+      "main": [[{ "node": "Gate 1 · Data-Quality", "type": "main", "index": 0 }]]
+    },
+    "Gate 1 · Data-Quality": {
+      "main": [[{ "node": "Gate 2 · Materiality + Decision", "type": "main", "index": 0 }]]
+    },
+    "Gate 2 · Materiality + Decision": {
+      "main": [[{ "node": "LLM · Draft Report Narrative", "type": "main", "index": 0 }]]
+    },
+    "LLM · Draft Report Narrative": {
+      "main": [[{ "node": "Assemble Report", "type": "main", "index": 0 }]]
+    },
+    "Assemble Report": {
+      "main": [[{ "node": "Deliver or Hold?", "type": "main", "index": 0 }]]
+    },
+    "Deliver or Hold?": {
+      "main": [
+        [{ "node": "Slack · Report Ready (approve to send)", "type": "main", "index": 0 }],
+        [{ "node": "LLM · Summarize Hold for Reviewer", "type": "main", "index": 0 }]
+      ]
+    },
+    "Slack · Report Ready (approve to send)": {
+      "main": [[{ "node": "Log Run", "type": "main", "index": 0 }]]
+    },
+    "LLM · Summarize Hold for Reviewer": {
+      "main": [[{ "node": "Parse Hold Summary", "type": "main", "index": 0 }]]
+    },
+    "Parse Hold Summary": {
+      "main": [[{ "node": "Slack · Human Review Queue", "type": "main", "index": 0 }]]
+    },
+    "Slack · Human Review Queue": {
+      "main": [[{ "node": "Log Run", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}
