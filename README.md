@@ -82,7 +82,7 @@ The pull → compute deterministically → gate on data-quality → gate on mate
 
 ---
 
-Built by Surabhi Deb as part of an AI automation portfolio. [See the full project index]([https://surabhideb.github.io/earlyecho-website/]) for related builds (voice lead qualification, RAG support agents, speed-to-lead systems).
+Built by Surabhi Deb as part of an AI automation portfolio. [See the full project index](https://surabhideb.github.io/earlyecho-website/) for related builds (voice lead qualification, RAG support agents, speed-to-lead systems).
 <img width="1786" height="702" alt="Client Reporting" src="https://github.com/user-attachments/assets/e1e38da9-ff5b-4f60-acf0-10f7c24e3116" />
 
 
